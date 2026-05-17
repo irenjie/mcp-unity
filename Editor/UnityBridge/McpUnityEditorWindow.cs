@@ -275,7 +275,15 @@ namespace McpUnity.Unity
 
             EditorGUILayout.Space();
 
+            ShowConfigButton("Cursor (Project)", McpUtils.AddToCursorProjectConfig);
+
+            EditorGUILayout.Space();
+
             ShowConfigButton("Claude Code", McpUtils.AddToClaudeCodeConfig);
+
+            EditorGUILayout.Space();
+
+            ShowConfigButton("Claude Code (Project)", McpUtils.AddToClaudeCodeProjectConfig);
 
             EditorGUILayout.Space();
 
@@ -284,6 +292,13 @@ namespace McpUnity.Unity
             EditorGUILayout.Space();
 
             ShowConfigButton("Codex CLI", McpUtils.AddToCodexCliConfig);
+
+            EditorGUILayout.Space();
+
+            ShowConfigButton(
+                "Codex CLI (Project)",
+                McpUtils.AddToCodexCliProjectConfig,
+                "Codex only loads this project config after you mark the project as trusted. The first time you run `codex` from this project's root, approve the trust prompt.");
 
             EditorGUILayout.Space();
 
@@ -633,7 +648,7 @@ namespace McpUnity.Unity
         
             
         // Helper to show a config button with unified logic
-        private void ShowConfigButton(string configLabel, Func<bool, bool> configAction)
+        private void ShowConfigButton(string configLabel, Func<bool, bool> configAction, string successFollowUp = null)
         {
             bool isSupported = McpUtils.IsAutoConfigSupported(configLabel);
 
@@ -644,7 +659,12 @@ namespace McpUnity.Unity
                     bool added = configAction(_tabsIndentationJson);
                     if (added)
                     {
-                        EditorUtility.DisplayDialog("Success", $"The MCP configuration was successfully added to the {configLabel} config file.", "OK");
+                        string message = $"The MCP configuration was successfully added to the {configLabel} config file.";
+                        if (!string.IsNullOrEmpty(successFollowUp))
+                        {
+                            message += "\n\n" + successFollowUp;
+                        }
+                        EditorUtility.DisplayDialog("Success", message, "OK");
                     }
                     else
                     {

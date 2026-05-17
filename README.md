@@ -254,7 +254,9 @@ Open the MCP configuration file of your AI client and add the MCP Unity server c
 
 > Replace `ABSOLUTE/PATH/TO` with the absolute path to your MCP Unity installation or just copy the text from the Unity Editor MCP Server window (Tools > MCP Unity > Server Window).
 >
-> For configs that live inside the Unity project tree and get committed to git (e.g. `<project>/.vscode/mcp.json`, `<project>/opencode.json`), prefer a project-relative path so the same file works across machines. Toggle **"Use relative path"** in the Server Window to switch the copy-paste snippet between absolute and project-relative forms. The **Configure GitHub Copilot** and **Configure OpenCode** buttons already emit relative paths automatically.
+> For configs that live inside the Unity project tree and get committed to git (e.g. `<project>/.vscode/mcp.json`, `<project>/opencode.json`, `<project>/.cursor/mcp.json`, `<project>/.mcp.json`, `<project>/.codex/config.toml`), prefer a project-relative path so the same file works across machines. Toggle **"Use relative path"** in the Server Window to switch the copy-paste snippet between absolute and project-relative forms. The **Configure GitHub Copilot**, **Configure OpenCode**, **Configure Cursor (Project)**, **Configure Claude Code (Project)**, and **Configure Codex CLI (Project)** buttons already emit relative paths automatically.
+>
+> Project-local buttons (Cursor / Claude Code / Codex CLI) write the MCP server entry into the Unity project directory instead of your global user config, so other (non-Unity) projects don't see MCP connection-failure warnings. For **Codex CLI (Project)** specifically, you must approve the project trust prompt the first time you run `codex` from the project root, otherwise Codex ignores `<project>/.codex/config.toml`.
 
 **For JSON-based clients** (Cursor, Windsurf, Claude Code, GitHub Copilot, etc.):
 
@@ -293,6 +295,46 @@ For workspace-scoped VS Code / GitHub Copilot (`.vscode/mcp.json`), use `${works
 command = "node"
 args = ["ABSOLUTE/PATH/TO/mcp-unity/Server~/build/index.js"]
 ```
+
+**For Cursor — project-local** (`.cursor/mcp.json` in the Unity project root, project-relative path):
+
+```json
+{
+   "mcpServers": {
+       "mcp-unity": {
+          "command": "node",
+          "args": [
+             "Library/PackageCache/com.gamelovers.mcp-unity@<hash>/Server~/build/index.js"
+          ]
+       }
+   }
+}
+```
+
+**For Claude Code — project-local** (`.mcp.json` in the Unity project root, project-relative path — Claude Code's team-shared MCP config):
+
+```json
+{
+   "mcpServers": {
+       "mcp-unity": {
+          "command": "node",
+          "args": [
+             "Library/PackageCache/com.gamelovers.mcp-unity@<hash>/Server~/build/index.js"
+          ]
+       }
+   }
+}
+```
+
+**For Codex CLI — project-local** (`.codex/config.toml` in the Unity project root, project-relative path):
+
+```toml
+[mcp_servers.mcp-unity]
+command = "node"
+args = ["Library/PackageCache/com.gamelovers.mcp-unity@<hash>/Server~/build/index.js"]
+```
+
+> Codex layers this file over the global `~/.codex/config.toml`, but only when the project is marked trusted. The first time you `cd` into the project and run `codex`, approve the trust prompt — otherwise Codex ignores `.codex/config.toml`.
 
 **For OpenCode** (`opencode.json` in the Unity project root):
 

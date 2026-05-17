@@ -335,6 +335,36 @@ namespace McpUnity.Utils
         }
 
         /// <summary>
+        /// Adds the MCP configuration to the project-local Cursor config (<ProjectRoot>/.cursor/mcp.json).
+        /// Uses a project-relative path so the config is portable across machines when committed to git.
+        /// </summary>
+        public static bool AddToCursorProjectConfig(bool useTabsIndentation)
+        {
+            return AddToConfigFile(GetCursorProjectConfigPath(), useTabsIndentation, "Cursor (Project)", PathMode.ProjectRelative);
+        }
+
+        /// <summary>
+        /// Adds the MCP configuration to the project-local Claude Code config (<ProjectRoot>/.mcp.json).
+        /// This file is Claude Code's team-shared MCP config and is intended to be committed to git.
+        /// Uses a project-relative path so the config is portable across machines.
+        /// </summary>
+        public static bool AddToClaudeCodeProjectConfig(bool useTabsIndentation)
+        {
+            return AddToConfigFile(GetClaudeCodeProjectConfigPath(), useTabsIndentation, "Claude Code (Project)", PathMode.ProjectRelative);
+        }
+
+        /// <summary>
+        /// Adds the MCP configuration to the project-local Codex CLI config (<ProjectRoot>/.codex/config.toml).
+        /// Codex layers this over the global ~/.codex/config.toml only when the project is marked trusted
+        /// (Codex prompts the user the first time they run `codex` from the project root).
+        /// Uses a project-relative path so the config is portable across machines.
+        /// </summary>
+        public static bool AddToCodexCliProjectConfig(bool useTabsIndentation)
+        {
+            return AddToTomlConfigFile(GetCodexCliProjectConfigPath(), "Codex CLI (Project)", PathMode.ProjectRelative);
+        }
+
+        /// <summary>
         /// Returns whether automatic MCP configuration is supported for the given product on the current platform.
         /// </summary>
         public static bool IsAutoConfigSupported(string productName)
@@ -342,7 +372,10 @@ namespace McpUnity.Utils
             switch (productName)
             {
                 case "Claude Code":
+                case "Claude Code (Project)":
                 case "Codex CLI":
+                case "Codex CLI (Project)":
+                case "Cursor (Project)":
                 case "GitHub Copilot":
                 case "OpenCode":
                     return Application.platform == RuntimePlatform.WindowsEditor
@@ -371,7 +404,7 @@ namespace McpUnity.Utils
 
             if (Application.platform == RuntimePlatform.LinuxEditor)
             {
-                return $"Automatic {productName} configuration is currently available on Linux only for Claude Code, Codex CLI, GitHub Copilot, and OpenCode.";
+                return $"Automatic {productName} configuration is currently available on Linux only for Claude Code, Codex CLI, Cursor (Project), GitHub Copilot, and OpenCode.";
             }
 
             return $"Automatic {productName} configuration is not supported on {Application.platform}.";
@@ -656,8 +689,37 @@ namespace McpUnity.Utils
             {
                 return null;
             }
-            
+
             return Path.Combine(homeDir, ".codex", "config.toml");
+        }
+
+        /// <summary>
+        /// Gets the path to the project-local Cursor MCP config (<ProjectRoot>/.cursor/mcp.json).
+        /// </summary>
+        private static string GetCursorProjectConfigPath()
+        {
+            string projectRoot = Directory.GetParent(Application.dataPath).FullName;
+            return Path.Combine(projectRoot, ".cursor", "mcp.json");
+        }
+
+        /// <summary>
+        /// Gets the path to the project-local Claude Code MCP config (<ProjectRoot>/.mcp.json).
+        /// This is the team-shared config that Claude Code reads in addition to ~/.claude.json.
+        /// </summary>
+        private static string GetClaudeCodeProjectConfigPath()
+        {
+            string projectRoot = Directory.GetParent(Application.dataPath).FullName;
+            return Path.Combine(projectRoot, ".mcp.json");
+        }
+
+        /// <summary>
+        /// Gets the path to the project-local Codex CLI config (<ProjectRoot>/.codex/config.toml).
+        /// Codex layers this over ~/.codex/config.toml only when the project is marked trusted.
+        /// </summary>
+        private static string GetCodexCliProjectConfigPath()
+        {
+            string projectRoot = Directory.GetParent(Application.dataPath).FullName;
+            return Path.Combine(projectRoot, ".codex", "config.toml");
         }
 
         /// <summary>
@@ -688,19 +750,20 @@ namespace McpUnity.Utils
         /// </summary>
         /// <param name="configFilePath">Path to the TOML config file</param>
         /// <param name="productName">Name of the product (for error messages)</param>
+        /// <param name="pathMode">How to render the path to Server~/build/index.js</param>
         /// <returns>True if successfully added the config, false otherwise</returns>
-        private static bool AddToTomlConfigFile(string configFilePath, string productName)
+        private static bool AddToTomlConfigFile(string configFilePath, string productName, PathMode pathMode = PathMode.Absolute)
         {
             if (string.IsNullOrEmpty(configFilePath))
             {
                 Debug.LogError($"{productName} config file path not found. Please make sure {productName} is installed.");
                 return false;
             }
-            
+
             try
             {
                 // Generate fresh MCP config TOML
-                string mcpServerConfig = "\n" + GenerateMcpConfigToml();
+                string mcpServerConfig = "\n" + GenerateMcpConfigToml(pathMode);
                 
                 string directoryPath = Path.GetDirectoryName(configFilePath);
                 
