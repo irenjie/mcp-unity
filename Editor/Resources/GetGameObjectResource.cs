@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using UnityEngine;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 
@@ -20,6 +21,20 @@ namespace McpUnity.Resources
         }
         
         /// <summary>
+        /// Default maximum hierarchy depth when serializing children. Prevents oversized responses that
+        /// would otherwise exceed the MCP framework's response size limit and drop the WebSocket
+        /// connection. See: https://github.com/CoderGamester/mcp-unity/issues/134
+        /// </summary>
+        public const int DefaultMaxChildDepth = 2;
+
+        /// <summary>
+        /// Hard cap on serialized response size, in bytes. Once recursion accumulates this much JSON
+        /// the remaining children are replaced with a truncation marker so the caller can drill in
+        /// instead of losing the connection.
+        /// </summary>
+        public const int MaxResponseBytes = 5 * 1024 * 1024;
+
+        /// <summary>
         /// Fetch information about a specific GameObject
         /// </summary>
         /// <param name="parameters">Resource parameters as a JObject. Should include 'objectPathId' which can be either an instance ID or a path</param>
@@ -37,7 +52,7 @@ namespace McpUnity.Resources
             }
 
             string idOrName = parameters["idOrName"]?.ToObject<string>();
-            
+
             if (string.IsNullOrEmpty(idOrName))
             {
                 return new JObject
@@ -48,7 +63,7 @@ namespace McpUnity.Resources
             }
 
             GameObject gameObject = null;
-            
+
             // Try to parse as an instance ID first
             if (int.TryParse(idOrName, out int instanceId))
             {
@@ -61,7 +76,7 @@ namespace McpUnity.Resources
                 // Otherwise, treat it as a name or hierarchical path
                 gameObject = GameObject.Find(idOrName);
             }
-            
+
             // Check if the GameObject was found
             if (gameObject == null)
             {
@@ -72,9 +87,14 @@ namespace McpUnity.Resources
                 };
             }
 
+            int maxDepth = parameters["maxDepth"]?.ToObject<int?>() ?? DefaultMaxChildDepth;
+            bool includeComponents = parameters["includeComponents"]?.ToObject<bool?>() ?? true;
+            bool includeComponentProperties = parameters["includeComponentProperties"]?.ToObject<bool?>() ?? true;
+
             // Convert the GameObject to a JObject
-            JObject gameObjectData = GameObjectToJObject(gameObject, true);
-                
+            JObject gameObjectData = GameObjectToJObject(
+                gameObject, true, maxDepth, includeComponents, includeComponentProperties);
+
             // Create the response
             return new JObject
             {
@@ -86,23 +106,45 @@ namespace McpUnity.Resources
         }
 
         /// <summary>
-        /// Convert a GameObject to a JObject with its hierarchy
+        /// Convert a GameObject to a JObject with its hierarchy, scoped by depth, component toggles,
+        /// and a hard byte cap. The byte cap guards against responses exceeding the MCP framework's
+        /// 15 MB ceiling, which would otherwise drop the WebSocket connection (issue #134).
         /// </summary>
         /// <param name="gameObject">The GameObject to convert</param>
         /// <param name="includeDetailedComponents">Whether to include detailed component information</param>
+        /// <param name="maxDepth">Maximum child levels to recurse. 0 = no children. Default: <see cref="DefaultMaxChildDepth"/></param>
+        /// <param name="includeComponents">When false, the components array is omitted entirely</param>
+        /// <param name="includeComponentProperties">When false, components are listed without their reflected properties</param>
         /// <returns>A JObject representing the GameObject</returns>
-        public static JObject GameObjectToJObject(GameObject gameObject, bool includeDetailedComponents)
+        public static JObject GameObjectToJObject(
+            GameObject gameObject,
+            bool includeDetailedComponents,
+            int maxDepth = DefaultMaxChildDepth,
+            bool includeComponents = true,
+            bool includeComponentProperties = true)
+        {
+            int[] bytesUsed = { 0 };
+            return GameObjectToJObjectInternal(
+                gameObject,
+                includeDetailedComponents,
+                maxDepth,
+                includeComponents,
+                includeComponentProperties,
+                currentDepth: 0,
+                bytesUsed);
+        }
+
+        private static JObject GameObjectToJObjectInternal(
+            GameObject gameObject,
+            bool includeDetailedComponents,
+            int maxDepth,
+            bool includeComponents,
+            bool includeComponentProperties,
+            int currentDepth,
+            int[] bytesUsed)
         {
             if (gameObject == null) return null;
-            
-            // Add children
-            JArray childrenArray = new JArray();
-            foreach (Transform child in gameObject.transform)
-            {
-                childrenArray.Add(GameObjectToJObject(child.gameObject, includeDetailedComponents));
-            }
-            
-            // Create a JObject for the game object
+
             JObject gameObjectJson = new JObject
             {
                 ["name"] = gameObject.name,
@@ -111,11 +153,60 @@ namespace McpUnity.Resources
                 ["tag"] = gameObject.tag,
                 ["layer"] = gameObject.layer,
                 ["layerName"] = LayerMask.LayerToName(gameObject.layer),
-                ["instanceId"] = gameObject.GetInstanceID(),
-                ["components"] = GetComponentsInfo(gameObject, includeDetailedComponents),
-                ["children"] = childrenArray
+                ["instanceId"] = gameObject.GetInstanceID()
             };
-            
+
+            if (includeComponents)
+            {
+                gameObjectJson["components"] = GetComponentsInfo(
+                    gameObject, includeDetailedComponents, includeComponentProperties);
+            }
+
+            int childCount = gameObject.transform.childCount;
+            JArray childrenArray = new JArray();
+            gameObjectJson["children"] = childrenArray;
+
+            // Account for this node's own JSON before deciding whether to recurse further.
+            bytesUsed[0] += gameObjectJson.ToString(Formatting.None).Length;
+
+            if (childCount > 0 && currentDepth >= maxDepth)
+            {
+                gameObjectJson["_truncated"] = true;
+                gameObjectJson["_truncatedReason"] = "depth_limit";
+                gameObjectJson["_childCount"] = childCount;
+            }
+            else if (childCount > 0 && bytesUsed[0] > MaxResponseBytes)
+            {
+                gameObjectJson["_truncated"] = true;
+                gameObjectJson["_truncatedReason"] = "size_limit_exceeded";
+                gameObjectJson["_childCount"] = childCount;
+                gameObjectJson["_hint"] = "Response exceeded 5MB cap. Re-query specific children with maxDepth=0 or includeComponentProperties=false.";
+            }
+            else
+            {
+                foreach (Transform child in gameObject.transform)
+                {
+                    if (bytesUsed[0] > MaxResponseBytes)
+                    {
+                        gameObjectJson["_truncated"] = true;
+                        gameObjectJson["_truncatedReason"] = "size_limit_exceeded";
+                        gameObjectJson["_childCount"] = childCount;
+                        gameObjectJson["_serializedChildCount"] = childrenArray.Count;
+                        gameObjectJson["_hint"] = "Response exceeded 5MB cap. Re-query specific children with maxDepth=0 or includeComponentProperties=false.";
+                        break;
+                    }
+
+                    childrenArray.Add(GameObjectToJObjectInternal(
+                        child.gameObject,
+                        includeDetailedComponents,
+                        maxDepth,
+                        includeComponents,
+                        includeComponentProperties,
+                        currentDepth + 1,
+                        bytesUsed));
+                }
+            }
+
             return gameObjectJson;
         }
         
@@ -216,19 +307,24 @@ namespace McpUnity.Resources
         /// </summary>
         /// <param name="gameObject">The GameObject to get components from</param>
         /// <param name="includeDetailedInfo">Whether to include detailed component information</param>
+        /// <param name="includeProperties">When false, the per-component 'properties' object is omitted entirely.
+        /// Useful for callers that only need component type names, saving substantial response size.</param>
         /// <returns>A JArray containing component information</returns>
-        private static JArray GetComponentsInfo(GameObject gameObject, bool includeDetailedInfo = false)
+        private static JArray GetComponentsInfo(
+            GameObject gameObject,
+            bool includeDetailedInfo = false,
+            bool includeProperties = true)
         {
             Component[] components = gameObject.GetComponents<Component>();
             JArray componentsArray = new JArray();
-            
+
             foreach (Component component in components)
             {
                 if (component == null) continue;
-                
+
                 Type componentType = component.GetType();
                 bool skipDetailedInspection = ShouldSkipDetailedInspection(componentType);
-                
+
                 JObject componentJson = new JObject
                 {
                     ["type"] = componentType.Name,
@@ -236,7 +332,7 @@ namespace McpUnity.Resources
                 };
 
                 // Add detailed information if requested and component is safe to inspect
-                if (includeDetailedInfo)
+                if (includeDetailedInfo && includeProperties)
                 {
                     if (skipDetailedInspection)
                     {
@@ -250,10 +346,10 @@ namespace McpUnity.Resources
                         componentJson["properties"] = GetComponentProperties(component);
                     }
                 }
-                    
+
                 componentsArray.Add(componentJson);
             }
-            
+
             return componentsArray;
         }
         

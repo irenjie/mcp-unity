@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using UnityEngine;
+using UnityEditor;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using WebSocketSharp;
@@ -23,15 +24,17 @@ namespace McpUnity.Unity
     public class McpUnitySocketHandler : WebSocketBehavior
     {
         private readonly McpUnityServer _server;
-        
+        private readonly int _connectionGeneration;
+
         /// <summary>
-        /// Default constructor required by WebSocketSharp
+        /// Creates a WebSocket handler for the active server generation.
         /// </summary>
-        public McpUnitySocketHandler(McpUnityServer server)
+        public McpUnitySocketHandler(McpUnityServer server, int connectionGeneration)
         {
             _server = server;
+            _connectionGeneration = connectionGeneration;
         }
-        
+
         /// <summary>
         /// Create a standardized error response
         /// </summary>
@@ -51,66 +54,28 @@ namespace McpUnity.Unity
         }
         
         /// <summary>
-        /// Handle incoming messages from WebSocket clients
+        /// Handle incoming messages from WebSocket clients.
+        /// WebSocketSharp invokes this on a background thread; we marshal the entire
+        /// message-handling body onto Unity's main thread via EditorApplication.delayCall
+        /// before touching any Editor APIs.
+        ///
+        /// Why this matters: accessing EditorStyles or scheduling EditorCoroutines from
+        /// a background thread can NRE inside PropertyEditor+Styles..cctor, which under
+        /// CLR rules permanently bricks that type for the rest of the AppDomain and
+        /// turns the Inspector black until Unity is restarted.
         /// </summary>
-        protected override async void OnMessage(MessageEventArgs e)
+        protected override void OnMessage(MessageEventArgs e)
         {
-            try
+            if (!_server.ShouldTrackClient(_connectionGeneration))
             {
-                McpLogger.LogInfo($"WebSocket message received: {e.Data}");
-                JObject requestJson;
-                try
-                {
-                    requestJson = JObject.Parse(e.Data);
-                }
-                catch (JsonReaderException jre)
-                {
-                    McpLogger.LogError($"Invalid JSON received: {jre.Message}. Data: {e.Data}");
-                    // Attempt to send a parse error response. No requestId is available yet.
-                    Send(CreateResponse(null, CreateErrorResponse($"Invalid JSON format: {jre.Message}", "invalid_json")).ToString(Formatting.None));
-                    return;
-                }
+                CloseUntrackedConnection();
+                return;
+            }
 
-                var method = requestJson["method"]?.ToString();
-                var parameters = requestJson["params"] as JObject ?? new JObject();
-                var requestId = requestJson["id"]?.ToString();
-                // We need to dispatch to Unity's main thread and wait for completion
-                var tcs = new TaskCompletionSource<JObject>();
-                
-                if (string.IsNullOrEmpty(method))
-                {
-                    tcs.SetResult(CreateErrorResponse("Missing method in request", "invalid_request"));
-                }
-                else if (_server.TryGetTool(method, out var tool))
-                {
-                    EditorCoroutineUtility.StartCoroutineOwnerless(ExecuteTool(tool, parameters, tcs));
-                }
-                else if (_server.TryGetResource(method, out var resource))
-                {
-                    EditorCoroutineUtility.StartCoroutineOwnerless(FetchResourceCoroutine(resource, parameters, tcs));
-                }
-                else
-                {
-                    tcs.SetResult(CreateErrorResponse($"Unknown method: {method}", "unknown_method"));
-                }
-                
-                JObject responseJson = await tcs.Task;
-                JObject jsonRpcResponse = CreateResponse(requestId, responseJson);
-                string responseStr = jsonRpcResponse.ToString(Formatting.None);
-                
-                McpLogger.LogInfo($"WebSocket message response for request ID '{requestId}': {responseStr}");
-                
-                // Send the response back to the client
-                Send(responseStr);
-            }
-            catch (Exception ex)
-            {
-                McpLogger.LogError($"Error processing message: {ex.Message}");
-                
-                Send(CreateErrorResponse($"Internal server error: {ex.Message}", "internal_error").ToString(Formatting.None));
-            }
+            string data = e.Data;
+            EditorApplication.delayCall += () => HandleMessageAsync(data);
         }
-        
+
         /// <summary>
         /// Handle WebSocket connection open.
         /// Supports multiple concurrent MCP clients (e.g. multiple Claude Code instances).
@@ -122,6 +87,12 @@ namespace McpUnity.Unity
         /// </summary>
         protected override void OnOpen()
         {
+            if (!_server.ShouldTrackClient(_connectionGeneration))
+            {
+                CloseUntrackedConnection();
+                return;
+            }
+
             // Clean up inactive (dead) sessions to prevent file descriptor accumulation.
             // Only removes sessions that are no longer connected — active clients are preserved.
             // Note: Do NOT use ActiveIDs here — it pings every client and blocks.
@@ -152,12 +123,18 @@ namespace McpUnity.Unity
                 clientName = headers["X-Client-Name"];
             }
 
+            if (!_server.ShouldTrackClient(_connectionGeneration))
+            {
+                CloseUntrackedConnection();
+                return;
+            }
+
             // Add the client to the server's tracking dictionary
             _server.Clients[ID] = clientName;
 
             McpLogger.LogInfo($"WebSocket client connected (ID: {ID}, Name: {(string.IsNullOrEmpty(clientName) ? "Unknown" : clientName)}, Total clients: {_server.Clients.Count})");
         }
-        
+
         /// <summary>
         /// Handle WebSocket connection close
         /// </summary>
@@ -167,16 +144,100 @@ namespace McpUnity.Unity
 
             // Remove the client from the server
             _server.Clients.TryRemove(ID, out _);
-            
+
             McpLogger.LogInfo($"WebSocket client '{clientName}' disconnected: {e.Reason} (Remaining clients: {_server.Clients.Count})");
         }
-        
+
         /// <summary>
         /// Handle WebSocket errors
         /// </summary>
         protected override void OnError(ErrorEventArgs e)
         {
             McpLogger.LogError($"WebSocket error: {e.Message}");
+        }
+
+        /// <summary>
+        /// Process a WebSocket message on the Unity main thread.
+        /// Safe to call EditorCoroutineUtility, Selection, and other Editor APIs from here.
+        /// </summary>
+        private async void HandleMessageAsync(string data)
+        {
+            try
+            {
+                if (!_server.ShouldTrackClient(_connectionGeneration))
+                {
+                    CloseUntrackedConnection();
+                    return;
+                }
+
+                McpLogger.LogInfo($"WebSocket message received: {data}");
+                JObject requestJson;
+                try
+                {
+                    requestJson = JObject.Parse(data);
+                }
+                catch (JsonReaderException jre)
+                {
+                    McpLogger.LogError($"Invalid JSON received: {jre.Message}. Data: {data}");
+                    // Attempt to send a parse error response. No requestId is available yet.
+                    Send(CreateResponse(null, CreateErrorResponse($"Invalid JSON format: {jre.Message}", "invalid_json")).ToString(Formatting.None));
+                    return;
+                }
+
+                var method = requestJson["method"]?.ToString();
+                var parameters = requestJson["params"] as JObject ?? new JObject();
+                var requestId = requestJson["id"]?.ToString();
+                // We need to dispatch to Unity's main thread and wait for completion
+                var tcs = new TaskCompletionSource<JObject>();
+
+                if (string.IsNullOrEmpty(method))
+                {
+                    tcs.SetResult(CreateErrorResponse("Missing method in request", "invalid_request"));
+                }
+                else if (_server.TryGetTool(method, out var tool))
+                {
+                    EditorCoroutineUtility.StartCoroutineOwnerless(ExecuteTool(tool, parameters, tcs));
+                }
+                else if (_server.TryGetResource(method, out var resource))
+                {
+                    EditorCoroutineUtility.StartCoroutineOwnerless(FetchResourceCoroutine(resource, parameters, tcs));
+                }
+                else
+                {
+                    tcs.SetResult(CreateErrorResponse($"Unknown method: {method}", "unknown_method"));
+                }
+
+                JObject responseJson = await tcs.Task;
+                JObject jsonRpcResponse = CreateResponse(requestId, responseJson);
+                string responseStr = jsonRpcResponse.ToString(Formatting.None);
+
+                McpLogger.LogInfo($"WebSocket message response for request ID '{requestId}': {responseStr}");
+
+                // Send the response back to the client
+                Send(responseStr);
+            }
+            catch (Exception ex)
+            {
+                McpLogger.LogError($"Error processing message: {ex.Message}");
+
+                Send(CreateErrorResponse($"Internal server error: {ex.Message}", "internal_error").ToString(Formatting.None));
+            }
+        }
+
+        private void CloseUntrackedConnection()
+        {
+            try
+            {
+                WebSocket webSocket = Context?.WebSocket;
+                if (webSocket?.ReadyState == WebSocketState.Open)
+                {
+                    webSocket.Close(CloseStatusCode.Away, "Server is restarting");
+                }
+            }
+            catch (Exception ex)
+            {
+                McpLogger.LogWarning($"Error closing untracked WebSocket connection: {ex.Message}");
+            }
         }
         
         /// <summary>

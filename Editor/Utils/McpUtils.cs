@@ -11,8 +11,18 @@ using Newtonsoft.Json.Linq;
 namespace McpUnity.Utils
 {
     /// <summary>
-    /// Utility class for MCP configuration operations
+    /// Controls how the path to Server~/build/index.js is rendered in generated MCP configs.
     /// </summary>
+    public enum PathMode
+    {
+        /// <summary>Absolute filesystem path. Required for per-user/global configs (Cursor, Windsurf, etc.).</summary>
+        Absolute,
+        /// <summary>Path relative to the Unity project root. Used for OpenCode's opencode.json.</summary>
+        ProjectRelative,
+        /// <summary>Project-relative path prefixed with ${workspaceFolder}/. Used for VS Code / GitHub Copilot's .vscode/mcp.json.</summary>
+        VSCodeWorkspaceFolder
+    }
+
     /// <summary>
     /// Utility class for MCP configuration and system operations
     /// </summary>
@@ -25,7 +35,7 @@ namespace McpUnity.Utils
         /// <summary>
         /// Generates the MCP configuration JSON to setup the Unity MCP server in different AI Clients
         /// </summary>
-        public static string GenerateMcpConfigJson(bool useTabsIndentation)
+        public static string GenerateMcpConfigJson(bool useTabsIndentation, PathMode pathMode = PathMode.Absolute)
         {
             var config = new Dictionary<string, object>
             {
@@ -34,7 +44,7 @@ namespace McpUnity.Utils
                         { "mcp-unity", new Dictionary<string, object>
                             {
                                 { "command", "node" },
-                                { "args", new[] { Path.Combine(GetServerPath(), "build", "index.js") } }
+                                { "args", new[] { GetIndexJsPath(pathMode) } }
                             }
                         }
                     }
@@ -68,18 +78,91 @@ namespace McpUnity.Utils
         }
 
         /// <summary>
+        /// Generates the MCP configuration JSON for OpenCode (https://opencode.ai/).
+        /// OpenCode uses a different schema than the standard `mcpServers` shape:
+        ///   { "$schema": ..., "mcp": { "mcp-unity": { "type": "local", "enabled": true, "command": [...], "environment": {} } } }
+        /// </summary>
+        public static string GenerateOpenCodeConfigJson(bool useTabsIndentation, PathMode pathMode = PathMode.Absolute)
+        {
+            string indexJsPath = GetIndexJsPath(pathMode);
+
+            var config = new Dictionary<string, object>
+            {
+                { "$schema", "https://opencode.ai/config.json" },
+                { "mcp", new Dictionary<string, object>
+                    {
+                        { "mcp-unity", new Dictionary<string, object>
+                            {
+                                { "type", "local" },
+                                { "enabled", true },
+                                { "command", new[] { "node", indexJsPath } },
+                                { "environment", new Dictionary<string, object>() }
+                            }
+                        }
+                    }
+                }
+            };
+
+            var stringWriter = new StringWriter();
+            using (var jsonWriter = new JsonTextWriter(stringWriter))
+            {
+                jsonWriter.Formatting = Formatting.Indented;
+
+                if (useTabsIndentation)
+                {
+                    jsonWriter.IndentChar = '\t';
+                    jsonWriter.Indentation = 1;
+                }
+                else
+                {
+                    jsonWriter.IndentChar = ' ';
+                    jsonWriter.Indentation = 2;
+                }
+
+                var serializer = new JsonSerializer();
+                serializer.Serialize(jsonWriter, config);
+            }
+
+            return stringWriter.ToString().Replace("\\", "/").Replace("//", "/");
+        }
+
+        /// <summary>
         /// Generates the MCP configuration TOML to setup the Unity MCP server in TOML-based AI Clients (e.g., Codex CLI)
         /// </summary>
         /// <returns>The TOML configuration string for mcp-unity server</returns>
-        public static string GenerateMcpConfigToml()
+        public static string GenerateMcpConfigToml(PathMode pathMode = PathMode.Absolute)
         {
-            string indexJsPath = Path.Combine(GetServerPath(), "build", "index.js").Replace("\\", "/");
-            
+            string indexJsPath = GetIndexJsPath(pathMode);
+
             var sb = new System.Text.StringBuilder();
             sb.AppendLine("[mcp_servers.mcp-unity]");
             sb.AppendLine("command = \"node\"");
             sb.AppendLine($"args = [\"{indexJsPath}\"]");
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// Returns the path to Server~/build/index.js rendered according to the given <see cref="PathMode"/>.
+        /// All returned paths use forward slashes.
+        /// </summary>
+        private static string GetIndexJsPath(PathMode mode)
+        {
+            string absoluteIndexJs = Path.Combine(GetServerPath(), "build", "index.js").Replace("\\", "/");
+
+            if (mode == PathMode.Absolute)
+            {
+                return absoluteIndexJs;
+            }
+
+            string projectRoot = Directory.GetParent(Application.dataPath).FullName.Replace("\\", "/");
+            string relativeIndexJs = Path.GetRelativePath(projectRoot, absoluteIndexJs).Replace("\\", "/");
+
+            if (mode == PathMode.VSCodeWorkspaceFolder)
+            {
+                return "${workspaceFolder}/" + relativeIndexJs;
+            }
+
+            return relativeIndexJs;
         }
 
         /// <summary>
@@ -222,12 +305,13 @@ namespace McpUnity.Utils
         }
 
         /// <summary>
-        /// Adds the MCP configuration to the GitHub Copilot config file
+        /// Adds the MCP configuration to the GitHub Copilot config file.
+        /// Uses ${workspaceFolder}-prefixed path so the config is portable across machines when committed to git.
         /// </summary>
         public static bool AddToGitHubCopilotConfig(bool useTabsIndentation)
         {
             string configFilePath = GetGitHubCopilotConfigPath();
-            return AddToConfigFile(configFilePath, useTabsIndentation, "GitHub Copilot");
+            return AddToConfigFile(configFilePath, useTabsIndentation, "GitHub Copilot", PathMode.VSCodeWorkspaceFolder);
         }
 
         /// <summary>
@@ -240,6 +324,47 @@ namespace McpUnity.Utils
         }
 
         /// <summary>
+        /// Adds the MCP configuration to the OpenCode config file (opencode.json in project root).
+        /// OpenCode uses a custom JSON schema, so this does not reuse the standard mcpServers helpers.
+        /// Uses a project-relative path so the config is portable across machines when committed to git.
+        /// </summary>
+        public static bool AddToOpenCodeConfig(bool useTabsIndentation)
+        {
+            string configFilePath = GetOpenCodeConfigPath();
+            return AddToOpenCodeConfigFile(configFilePath, useTabsIndentation, PathMode.ProjectRelative);
+        }
+
+        /// <summary>
+        /// Adds the MCP configuration to the project-local Cursor config (<ProjectRoot>/.cursor/mcp.json).
+        /// Uses a project-relative path so the config is portable across machines when committed to git.
+        /// </summary>
+        public static bool AddToCursorProjectConfig(bool useTabsIndentation)
+        {
+            return AddToConfigFile(GetCursorProjectConfigPath(), useTabsIndentation, "Cursor (Project)", PathMode.ProjectRelative);
+        }
+
+        /// <summary>
+        /// Adds the MCP configuration to the project-local Claude Code config (<ProjectRoot>/.mcp.json).
+        /// This file is Claude Code's team-shared MCP config and is intended to be committed to git.
+        /// Uses a project-relative path so the config is portable across machines.
+        /// </summary>
+        public static bool AddToClaudeCodeProjectConfig(bool useTabsIndentation)
+        {
+            return AddToConfigFile(GetClaudeCodeProjectConfigPath(), useTabsIndentation, "Claude Code (Project)", PathMode.ProjectRelative);
+        }
+
+        /// <summary>
+        /// Adds the MCP configuration to the project-local Codex CLI config (<ProjectRoot>/.codex/config.toml).
+        /// Codex layers this over the global ~/.codex/config.toml only when the project is marked trusted
+        /// (Codex prompts the user the first time they run `codex` from the project root).
+        /// Uses a project-relative path so the config is portable across machines.
+        /// </summary>
+        public static bool AddToCodexCliProjectConfig(bool useTabsIndentation)
+        {
+            return AddToTomlConfigFile(GetCodexCliProjectConfigPath(), "Codex CLI (Project)", PathMode.ProjectRelative);
+        }
+
+        /// <summary>
         /// Returns whether automatic MCP configuration is supported for the given product on the current platform.
         /// </summary>
         public static bool IsAutoConfigSupported(string productName)
@@ -247,8 +372,12 @@ namespace McpUnity.Utils
             switch (productName)
             {
                 case "Claude Code":
+                case "Claude Code (Project)":
                 case "Codex CLI":
+                case "Codex CLI (Project)":
+                case "Cursor (Project)":
                 case "GitHub Copilot":
+                case "OpenCode":
                     return Application.platform == RuntimePlatform.WindowsEditor
                         || Application.platform == RuntimePlatform.OSXEditor
                         || Application.platform == RuntimePlatform.LinuxEditor;
@@ -275,7 +404,7 @@ namespace McpUnity.Utils
 
             if (Application.platform == RuntimePlatform.LinuxEditor)
             {
-                return $"Automatic {productName} configuration is currently available on Linux only for Claude Code, Codex CLI, and GitHub Copilot.";
+                return $"Automatic {productName} configuration is currently available on Linux only for Claude Code, Codex CLI, Cursor (Project), GitHub Copilot, and OpenCode.";
             }
 
             return $"Automatic {productName} configuration is not supported on {Application.platform}.";
@@ -287,17 +416,18 @@ namespace McpUnity.Utils
         /// <param name="configFilePath">Path to the config file</param>
         /// <param name="useTabsIndentation">Whether to use tabs for indentation</param>
         /// <param name="productName">Name of the product (for error messages)</param>
+        /// <param name="pathMode">How to render the path to Server~/build/index.js</param>
         /// <returns>True if successfuly added the config, false otherwise</returns>
-        private static bool AddToConfigFile(string configFilePath, bool useTabsIndentation, string productName)
+        private static bool AddToConfigFile(string configFilePath, bool useTabsIndentation, string productName, PathMode pathMode = PathMode.Absolute)
         {
             if (string.IsNullOrEmpty(configFilePath))
             {
                 Debug.LogError($"{productName} config file not found. Please make sure {productName} is installed.");
                 return false;
             }
-                
+
             // Generate fresh MCP config JSON
-            string mcpConfigJson = GenerateMcpConfigJson(useTabsIndentation);
+            string mcpConfigJson = GenerateMcpConfigJson(useTabsIndentation, pathMode);
             
             try
             {
@@ -482,6 +612,73 @@ namespace McpUnity.Utils
         }
 
         /// <summary>
+        /// Gets the path to the OpenCode config file (opencode.json in the Unity project root).
+        /// OpenCode reads its config per-project, not per-user, so this path is OS-independent.
+        /// </summary>
+        /// <returns>The path to the OpenCode config file</returns>
+        private static string GetOpenCodeConfigPath()
+        {
+            string projectRoot = Directory.GetParent(Application.dataPath).FullName;
+            return Path.Combine(projectRoot, "opencode.json");
+        }
+
+        /// <summary>
+        /// Adds the MCP configuration to the OpenCode config file. Preserves existing
+        /// `$schema` and any unrelated entries under `mcp`, only upserting `mcp["mcp-unity"]`.
+        /// </summary>
+        private static bool AddToOpenCodeConfigFile(string configFilePath, bool useTabsIndentation, PathMode pathMode = PathMode.Absolute)
+        {
+            const string productName = "OpenCode";
+
+            if (string.IsNullOrEmpty(configFilePath))
+            {
+                Debug.LogError($"{productName} config file path could not be resolved.");
+                return false;
+            }
+
+            try
+            {
+                string mcpConfigJson = GenerateOpenCodeConfigJson(useTabsIndentation, pathMode);
+                JObject mcpConfig = JObject.Parse(mcpConfigJson);
+                JToken newServerEntry = mcpConfig["mcp"]?["mcp-unity"];
+
+                if (newServerEntry == null)
+                {
+                    Debug.LogError($"Failed to generate {productName} configuration: missing mcp-unity entry.");
+                    return false;
+                }
+
+                if (!File.Exists(configFilePath))
+                {
+                    File.WriteAllText(configFilePath, mcpConfigJson);
+                    return true;
+                }
+
+                string existingJson = File.ReadAllText(configFilePath);
+                JObject existingConfig = string.IsNullOrWhiteSpace(existingJson)
+                    ? new JObject()
+                    : JObject.Parse(existingJson);
+
+                JObject mcpSection = existingConfig["mcp"] as JObject;
+                if (mcpSection == null)
+                {
+                    mcpSection = new JObject();
+                    existingConfig["mcp"] = mcpSection;
+                }
+
+                mcpSection["mcp-unity"] = newServerEntry;
+
+                File.WriteAllText(configFilePath, existingConfig.ToString(Formatting.Indented));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"Failed to add MCP configuration to {productName}: {ex}");
+                return false;
+            }
+        }
+
+        /// <summary>
         /// Gets the path to the Codex CLI config file based on the current OS
         /// </summary>
         /// <returns>The path to the Codex CLI config file</returns>
@@ -492,8 +689,37 @@ namespace McpUnity.Utils
             {
                 return null;
             }
-            
+
             return Path.Combine(homeDir, ".codex", "config.toml");
+        }
+
+        /// <summary>
+        /// Gets the path to the project-local Cursor MCP config (<ProjectRoot>/.cursor/mcp.json).
+        /// </summary>
+        private static string GetCursorProjectConfigPath()
+        {
+            string projectRoot = Directory.GetParent(Application.dataPath).FullName;
+            return Path.Combine(projectRoot, ".cursor", "mcp.json");
+        }
+
+        /// <summary>
+        /// Gets the path to the project-local Claude Code MCP config (<ProjectRoot>/.mcp.json).
+        /// This is the team-shared config that Claude Code reads in addition to ~/.claude.json.
+        /// </summary>
+        private static string GetClaudeCodeProjectConfigPath()
+        {
+            string projectRoot = Directory.GetParent(Application.dataPath).FullName;
+            return Path.Combine(projectRoot, ".mcp.json");
+        }
+
+        /// <summary>
+        /// Gets the path to the project-local Codex CLI config (<ProjectRoot>/.codex/config.toml).
+        /// Codex layers this over ~/.codex/config.toml only when the project is marked trusted.
+        /// </summary>
+        private static string GetCodexCliProjectConfigPath()
+        {
+            string projectRoot = Directory.GetParent(Application.dataPath).FullName;
+            return Path.Combine(projectRoot, ".codex", "config.toml");
         }
 
         /// <summary>
@@ -524,19 +750,20 @@ namespace McpUnity.Utils
         /// </summary>
         /// <param name="configFilePath">Path to the TOML config file</param>
         /// <param name="productName">Name of the product (for error messages)</param>
+        /// <param name="pathMode">How to render the path to Server~/build/index.js</param>
         /// <returns>True if successfully added the config, false otherwise</returns>
-        private static bool AddToTomlConfigFile(string configFilePath, string productName)
+        private static bool AddToTomlConfigFile(string configFilePath, string productName, PathMode pathMode = PathMode.Absolute)
         {
             if (string.IsNullOrEmpty(configFilePath))
             {
                 Debug.LogError($"{productName} config file path not found. Please make sure {productName} is installed.");
                 return false;
             }
-            
+
             try
             {
                 // Generate fresh MCP config TOML
-                string mcpServerConfig = "\n" + GenerateMcpConfigToml();
+                string mcpServerConfig = "\n" + GenerateMcpConfigToml(pathMode);
                 
                 string directoryPath = Path.GetDirectoryName(configFilePath);
                 
